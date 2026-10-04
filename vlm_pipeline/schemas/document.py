@@ -2,6 +2,24 @@ from enum import Enum
 from typing import Optional, List
 from pydantic import BaseModel, Field
 
+class FieldItem(BaseModel):
+    field_label: str
+    extracted_text: Optional[str] = None
+    status: str
+    confidence_score: float = 1.0
+
+class DocumentExtractionResult(BaseModel):
+    document_type: Optional[str] = None
+    number_fiche: Optional[str] = None
+    cin: Optional[str] = Field(
+        default=None, 
+        description="Numéro CNI, identifiant de suivi ou numéro de patiente fictive"
+    )
+    region: Optional[str] = None
+    province: Optional[str] = None
+    etablissement_sanitaire: Optional[str] = None
+    fields: List[FieldItem] = []
+
 class FieldStatus(str, Enum):
     CONNU = "CONNU"
     INCONNU = "INCONNU"

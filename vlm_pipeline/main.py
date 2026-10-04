@@ -1,68 +1,113 @@
 import os
 import base64
+from typing import Optional
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+
+from schemas.document import DocumentExtractionResult
+from schemas.verification import (
+    ActionUtilisateur, 
+    ExtractionResponse, 
+    VerificationRequest, 
+    VerificationResponse
+)
 from services.vlm_extractor import VLMExtractorService
-from services.patient_linker import PatientLinkerService
-from services.offline_queue import OfflineQueueManager
-from schemas.enums import RecordLifecycleState
+from services.verification_service import VerificationService
 
-def encode_image_to_base64(image_path: str) -> str:
-    with open(image_path, "rb") as image_file:
-        encoded = base64.b64encode(image_file.read()).decode('utf-8')
-        return f"data:image/jpeg;base64,{encoded}"
+app = FastAPI(title="API Pipeline VLM - Backend Mobile")
 
-def main():
-    api_key = os.getenv("NVIDIA_API_KEY") or os.getenv("OPENAI_API_KEY", "votre-cle-api")
-    
-    # Initialisation des services avec le bon nom de classe
-    extractor = VLMExtractorService(
-        api_key=api_key,
-        model_name="meta/llama-3.2-11b-vision-instruct",
-        base_url="https://integrate.api.nvidia.com/v1"
-    )
-    linker = PatientLinkerService()
-    queue = OfflineQueueManager()
+# Configuration CORS pour autoriser les requetes depuis Flutter
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    test_images = [
-        "data/1-1.jpg",
-        "data/1-2.jpg",
-        "data/1-4.jpg",
-        "data/1-5.jpg",
-        "data/dossiers_specimen_10_patientes-17__1JAXyAcTm1.png",
-        "data/dossiers_specimen_10_patientes-18__1baIjVKeMw.png",
-        "data/dossiers_specimen_10_patientes-19__1CnJAvJyYe.png",
-        "data/dossiers_specimen_10_patientes-20__1Fe9vKiY1J.png",
-        "data/dossiers_specimen_10_patientes-21__1uKoGpOPgd.png",
-        "data/dossiers_specimen_10_patientes-22.png",
-        "data/dossiers_specimen_10_patientes-23__1Ot9b8mqEv.png",
-    ]
+API_KEY = os.getenv("NVIDIA_API_KEY")
+vlm_service = VLMExtractorService(api_key=API_KEY) if API_KEY else None
 
-    for img_path in test_images:
-        if not os.path.exists(img_path):
-            print(f"[AVERTISSEMENT] Fichier non trouve : {img_path}")
-            continue
 
-        print(f"\n--- Traitement du fichier : {img_path} ---")
-        
-        # 1. Mise en file d'attente hors ligne
-        rec_id = queue.enqueue_image(img_path)
-        print(f"Enregistrement cree [{rec_id}] - Etat: {RecordLifecycleState.PENDING_AI.value}")
+def extract_patient_id(extraction_result: DocumentExtractionResult) -> Optional[str]:
+    if getattr(extraction_result, "cin", None):
+        return extraction_result.cin
 
-        # 2. Inference VLM via NVIDIA NIM
-        try:
-            img_b64 = encode_image_to_base64(img_path)
-            extraction_result = extractor.process_page_image(img_b64)
-            queue.update_state(rec_id, RecordLifecycleState.AI_PROCESSED, extraction_result)
-            
-            # 3. Liaison de la page au dossier longitudinal
-            link_status = linker.link_page_to_profile(extraction_result)
-            queue.update_state(rec_id, RecordLifecycleState.PATIENT_MATCHED)
-            
-            print(f"Statut de liaison : {link_status}")
-            print("Extrait JSON partiel :")
-            print(extraction_result.model_dump_json(indent=2, exclude_none=True))
+    if getattr(extraction_result, "number_fiche", None):
+        return extraction_result.number_fiche
 
-        except Exception as e:
-            print(f"[ERREUR] Pendant l'extraction de {img_path} : {e}")
+    if hasattr(extraction_result, "fields") and extraction_result.fields:
+        labels = ["cni", "cin", "n° de la fiche", "numéro de suivi", "identifiant", "n° fiche", "numero fiche"]
+        for field in extraction_result.fields:
+            label = getattr(field, "field_label", "") or ""
+            if any(term in label.lower() for term in labels):
+                extracted_text = getattr(field, "extracted_text", None)
+                if extracted_text and getattr(field, "status", "") == "CONNU":
+                    return extracted_text
+
+    return None
+
+
+@app.post("/api/extract", response_model=ExtractionResponse)
+async def extract_document(file: UploadFile = File(...)):
+    if not vlm_service:
+        return VerificationService.preparer_reponse_extraction(
+            result=None, ia_disponible=False
+        )
+
+    try:
+        contents = await file.read()
+        encoded_string = base64.b64encode(contents).decode("utf-8")
+        mime_type = file.content_type or "image/jpeg"
+        image_b64 = f"data:{mime_type};base64,{encoded_string}"
+
+        extraction_result = vlm_service.process_page_image(image_b64)
+        patient_id = extract_patient_id(extraction_result)
+
+        return VerificationService.preparer_reponse_extraction(
+            result=extraction_result,
+            patient_id=patient_id,
+            ia_disponible=True
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur d'extraction: {str(e)}")
+
+
+@app.post("/api/verify", response_model=VerificationResponse)
+async def verify_document(payload: VerificationRequest):
+    action = payload.action
+
+    if action == ActionUtilisateur.CONFIRMER:
+        return VerificationResponse(
+            status="CONFIRME",
+            message="Document valide et prêt pour le stockage.",
+            final_data=payload.extraction_data
+        )
+
+    elif action == ActionUtilisateur.CORRIGER:
+        data_corrigee = VerificationService.appliquer_corrections(
+            payload.extraction_data, payload.corrections or []
+        )
+        return VerificationResponse(
+            status="CORRIGE",
+            message="Corrections appliquees avec succes.",
+            final_data=data_corrigee
+        )
+
+    elif action == ActionUtilisateur.REPRENDRE_PHOTO:
+        return VerificationResponse(
+            status="REJETEE",
+            message="Reprise de photo requise."
+        )
+
+    elif action == ActionUtilisateur.SAISIE_MANUELLE:
+        return VerificationResponse(
+            status="MANUEL",
+            message="Basculement en saisie manuelle."
+        )
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    # Le port 8000 sur 0.0.0.0 rend le serveur accessible au reseau local et aux emulateurs
+    uvicorn.run(app, host="0.0.0.0", port=8000)
