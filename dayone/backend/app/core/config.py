@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     environment: str = "development"
     database_url: str = "postgresql+psycopg://dayone:dayone@localhost:5432/dayone"
     cors_origins: str = "*"
+    jwt_secret: str = "dev-only-change-me"
+    jwt_expire_days: int = 7
 
     @property
     def cors_origins_list(self) -> list[str]:
